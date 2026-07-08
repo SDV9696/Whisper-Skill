@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import platform
+import queue
 import subprocess
 import sys
 import tempfile
@@ -231,49 +232,110 @@ def setup_wizard():
 # ─── Audio recording ────────────────────────────────────────────────────────
 
 
+def _trim_edge_silence(audio, sample_rate: int, max_trim_ms: int, threshold: float = 0.01):
+    """Обрезать до max_trim_ms тишины (|amplitude| < threshold) с начала и
+    конца записи. Не трогает паузы внутри речи — только края.
+
+    Хвостовая тишина/дыхание перед отпусканием хоткея — частый триггер
+    "галлюцинаций" у Whisper (модель по инерции договаривает что-то за
+    пределами реальной речи, иногда даже не тем алфавитом/языком).
+    """
+    import numpy as np
+
+    max_trim_samples = int(sample_rate * max_trim_ms / 1000)
+    if max_trim_samples <= 0 or len(audio) == 0:
+        return audio
+
+    levels = np.abs(audio)
+    if levels.ndim > 1:
+        levels = levels.max(axis=1)
+
+    start = 0
+    while start < min(max_trim_samples, len(levels)) and levels[start] < threshold:
+        start += 1
+
+    end = len(levels)
+    limit = max(0, len(levels) - max_trim_samples)
+    while end > limit and end > start and levels[end - 1] < threshold:
+        end -= 1
+
+    return audio[start:end]
+
+
 class AudioRecorder:
-    def __init__(self, sample_rate: int = 16000, channels: int = 1):
+    def __init__(self, sample_rate: int = 16000, channels: int = 1, trim_silence_ms: int = 200):
         self.sample_rate = sample_rate
         self.channels = channels
+        self.trim_silence_ms = trim_silence_ms
         self._frames: list = []
         self._stream = None
         self._recording = False
+        self._armed = False
+        self._lock = threading.Lock()
+        self._init_lock = threading.Lock()
+
+    def _ensure_stream(self) -> None:
+        """Открыть входной поток один раз и больше не закрывать.
+
+        Переоткрытие потока на каждое нажатие хоткея (как было раньше)
+        давало "глухие" первые 2-5 сек записи на некоторых USB-микрофонах —
+        драйвер/AGC заново калибруется при каждом открытии устройства.
+        Держим поток тёплым постоянно; start()/stop() только переключают,
+        куда льются кадры (в буфер текущей диктовки или в никуда).
+        """
+        import sounddevice as sd
+
+        if self._stream is not None:
+            return
+
+        with self._init_lock:
+            if self._stream is not None:
+                return
+
+            def callback(indata, frames, time_info, status):
+                if status:
+                    logging.warning(f"audio status: {status}")
+                with self._lock:
+                    if self._armed:
+                        self._frames.append(indata.copy())
+
+            stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="float32",
+                callback=callback,
+            )
+            stream.start()
+            self._stream = stream
 
     def start(self) -> None:
-        import sounddevice as sd
-        import numpy as np
-
-        self._frames = []
+        self._ensure_stream()
+        with self._lock:
+            self._frames = []
+            self._armed = True
         self._recording = True
-
-        def callback(indata, frames, time_info, status):
-            if status:
-                logging.warning(f"audio status: {status}")
-            self._frames.append(indata.copy())
-
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype="float32",
-            callback=callback,
-        )
-        self._stream.start()
 
     def stop(self) -> Optional[str]:
         """Остановить запись и сохранить в WAV. Вернуть путь к файлу."""
         import numpy as np
         import soundfile as sf
 
-        if not self._recording or not self._stream:
+        if not self._recording:
             return None
         self._recording = False
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
+        with self._lock:
+            self._armed = False
+            # Не очищаем self._frames здесь: вызывающий код (stop_and_transcribe)
+            # читает recorder.duration_sec СРАЗУ ПОСЛЕ stop() — если обнулить
+            # буфер тут, длительность всегда будет 0. Очищаем только в start().
+            frames = list(self._frames)
 
-        if not self._frames:
+        if not frames:
             return None
-        audio = np.concatenate(self._frames, axis=0)
+        audio = np.concatenate(frames, axis=0)
+        audio = _trim_edge_silence(audio, self.sample_rate, self.trim_silence_ms)
+        if len(audio) == 0:
+            return None
 
         tmp = tempfile.NamedTemporaryFile(
             suffix=".wav", delete=False, prefix="voice_dictation_"
@@ -283,10 +345,11 @@ class AudioRecorder:
 
     @property
     def duration_sec(self) -> float:
-        if not self._frames:
+        with self._lock:
+            frames = list(self._frames)
+        if not frames:
             return 0.0
-        import numpy as np
-        total_samples = sum(f.shape[0] for f in self._frames)
+        total_samples = sum(f.shape[0] for f in frames)
         return total_samples / self.sample_rate
 
 
@@ -864,7 +927,13 @@ def main_loop(cfg: dict, cfg_path: Path):
 
     state = State()
     state_lock = threading.Lock()
-    recorder = AudioRecorder(cfg["sample_rate"], cfg["channels"])
+    recorder = AudioRecorder(cfg["sample_rate"], cfg["channels"], cfg.get("trim_silence_ms", 200))
+    # Открываем аудио-поток сразу в фоне, не дожидаясь первого хоткея —
+    # первое открытие потока даёт ~3-4с "мёртвой" тишины на некоторых
+    # USB-микрофонах (AGC/калибровка драйвера), см. AudioRecorder._ensure_stream.
+    # Прогреваем один раз здесь, чтобы к первому реальному нажатию хоткея
+    # микрофон уже "проснулся".
+    threading.Thread(target=recorder._ensure_stream, daemon=True).start()
 
     # macOS low-CPU mode: pystray в фоне и Tk у нас вызывают серьёзный
     # idle-CPU на маке (наблюдалось ~90% на M-чипе). Дефолтно отключаем оба
@@ -1071,15 +1140,41 @@ def main_loop(cfg: dict, cfg_path: Path):
         keys_needed = _parse_hotkey(hotkey_str)
         currently_pressed = set()
 
+        # Windows снимает низкоуровневый keyboard-хук молча, если его callback
+        # не возвращается быстро (WH_KEYBOARD_LL timeout) — start_recording()
+        # может на несколько сек блокироваться на открытии микрофона. Поэтому
+        # on_press/on_release только кладут команду в очередь и сразу
+        # возвращаются. Один воркер-поток разбирает очередь строго по
+        # порядку — если бы каждое нажатие/отпускание спавнило СВОЙ поток
+        # (как было раньше), быстрые повторные нажатия хоткея могли
+        # выполниться не в том порядке: "stop" от одного цикла успевал
+        # обогнать "start" следующего, recorder.stop() видел, что запись
+        # уже остановлена другим потоком, и молча возвращал None — ничего
+        # не транскрибировалось и не печаталось, выглядело как "не работает".
+        cmd_queue: "queue.Queue[str]" = queue.Queue()
+
+        def _hotkey_worker():
+            while True:
+                cmd = cmd_queue.get()
+                try:
+                    if cmd == "start":
+                        start_recording()
+                    elif cmd == "stop":
+                        stop_and_transcribe()
+                except Exception as e:
+                    logging.error(f"hotkey worker error: {e}")
+
+        threading.Thread(target=_hotkey_worker, daemon=True).start()
+
         def on_press(key):
             currently_pressed.add(_canonical_key(key))
             if keys_needed.issubset(currently_pressed):
-                start_recording()
+                cmd_queue.put("start")
 
         def on_release(key):
             ck = _canonical_key(key)
             if ck in keys_needed and state.is_recording:
-                stop_and_transcribe()
+                cmd_queue.put("stop")
             currently_pressed.discard(ck)
 
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:

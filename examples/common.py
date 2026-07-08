@@ -150,6 +150,8 @@ def transcribe(
         return _transcribe_whisperx(audio_path, language, model_name, word_timestamps, verbose)
     if backend == "cpp":
         return _transcribe_cpp(audio_path, language, model_name, word_timestamps, verbose)
+    if backend == "native_cpp":
+        return _transcribe_native_cpp(audio_path, language, model_name, word_timestamps, verbose)
     if backend == "openvino":
         return _transcribe_openvino(audio_path, language, model_name, word_timestamps, verbose)
     raise ValueError(f"unknown backend: {backend}")
@@ -450,6 +452,50 @@ def _transcribe_openvino(audio, lang, model_name, word_ts, verbose):
         language=lang or "?",
         segments=[seg],
         backend="openvino",
+        model=model_name,
+    )
+
+
+def _transcribe_native_cpp(audio, lang, model_name, word_ts, verbose):
+    """HTTP-клиент к whisper-server (whisper.cpp собранный из исходников,
+    напр. с -DGGML_VULKAN=1), который держит модель загруженной в памяти/GPU
+    между запросами. Используется когда готовые Python-биндинги (pywhispercpp)
+    недоступны с нужным GPU-бэкендом на этой машине — prebuilt wheel всегда
+    CPU-only, а сборка из исходников иногда падает. Без «тёплого» сервера
+    каждый вызов заново грузил бы модель с диска (для medium — секунды).
+
+    Настройка через env vars:
+        WHISPER_CPP_SERVER_URL — базовый URL сервера (default http://127.0.0.1:8080)
+        WHISPER_CPP_BIN        — путь к whisper-server(.exe), для автозапуска если не поднят
+        WHISPER_CPP_MODELS_DIR — папка с ggml-<model>.bin файлами (для автозапуска)
+    """
+    import requests
+
+    base_url = os.environ.get("WHISPER_CPP_SERVER_URL", "http://127.0.0.1:8080")
+
+    with open(audio, "rb") as f:
+        try:
+            resp = requests.post(
+                f"{base_url}/inference",
+                files={"file": f},
+                data={"language": lang or "auto", "response_format": "text"},
+                timeout=60,
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise RuntimeError(
+                f"whisper-server не отвечает на {base_url}. Запусти его: "
+                f"whisper-server.exe -m models\\ggml-{model_name}.bin --host 127.0.0.1 --port 8080 "
+                f"(см. scripts/start_whisper_server.bat)"
+            ) from e
+    resp.raise_for_status()
+    text = resp.text.strip()
+
+    seg = Segment(start=0.0, end=0.0, text=text)
+    return Result(
+        text=text,
+        language=lang or "?",
+        segments=[seg] if text else [],
+        backend="native_cpp",
         model=model_name,
     )
 
