@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
     "log_file": None,                    # путь к файлу лога или null = stdout
     "trim_silence_ms": 200,              # обрезать тишину в начале/конце записи
     "min_duration_ms": 300,              # игнорировать слишком короткие записи (промахи кнопкой)
+    "min_rms": 0.015,                    # игнорировать клипы тише этого RMS (шум/гул мика без речи —
+                                          # иначе whisper.cpp галлюцинирует текст на пустом месте)
     # macOS-специфика: pystray/Tk известно жрут CPU в фоне на macOS
     # (NSRunLoop в non-main thread + Tk thread-safety). Этот флаг автоматически
     # отключает show_tray и show_cursor_indicator на macOS, оставляя CLI-вывод
@@ -263,14 +265,25 @@ def _trim_edge_silence(audio, sample_rate: int, max_trim_ms: int, threshold: flo
 
 
 class AudioRecorder:
-    def __init__(self, sample_rate: int = 16000, channels: int = 1, trim_silence_ms: int = 200):
+    def __init__(self, sample_rate: int = 16000, channels: int = 1, trim_silence_ms: int = 200,
+                 min_rms: float = 0.015):
         self.sample_rate = sample_rate
         self.channels = channels
         self.trim_silence_ms = trim_silence_ms
+        # Порог RMS ниже которого клип считается "без речи" (фоновый шум/гул
+        # мика) и в Whisper не отправляется — см. _trim_edge_silence:
+        # whisper.cpp на таком входе не возвращает пустую строку, а
+        # ГАЛЛЮЦИНИРУЕТ правдоподобный мусор ("*звук выключения кнопки*" и
+        # т.п., обучен на субтитрах с такими аннотациями недо-речи).
+        # 0.015 откалибровано по реальному шумовому полу этого USB-мика
+        # (замерено ~0.008 RMS на 4с окружающего шума без речи, 2026-07-09) —
+        # запас в ~2x над шумом, но заметно ниже обычной громкости речи.
+        self.min_rms = min_rms
         self._frames: list = []
         self._stream = None
         self._recording = False
         self._armed = False
+        self.last_skip_reason: Optional[str] = None
         self._lock = threading.Lock()
         self._init_lock = threading.Lock()
 
@@ -330,11 +343,19 @@ class AudioRecorder:
             # буфер тут, длительность всегда будет 0. Очищаем только в start().
             frames = list(self._frames)
 
+        self.last_skip_reason = None
         if not frames:
+            self.last_skip_reason = "empty"
             return None
         audio = np.concatenate(frames, axis=0)
         audio = _trim_edge_silence(audio, self.sample_rate, self.trim_silence_ms)
         if len(audio) == 0:
+            self.last_skip_reason = "empty"
+            return None
+
+        rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+        if rms < self.min_rms:
+            self.last_skip_reason = f"silence (rms={rms:.4f} < {self.min_rms:.4f})"
             return None
 
         tmp = tempfile.NamedTemporaryFile(
@@ -927,7 +948,8 @@ def main_loop(cfg: dict, cfg_path: Path):
 
     state = State()
     state_lock = threading.Lock()
-    recorder = AudioRecorder(cfg["sample_rate"], cfg["channels"], cfg.get("trim_silence_ms", 200))
+    recorder = AudioRecorder(cfg["sample_rate"], cfg["channels"], cfg.get("trim_silence_ms", 200),
+                              cfg.get("min_rms", 0.015))
     # Открываем аудио-поток сразу в фоне, не дожидаясь первого хоткея —
     # первое открытие потока даёт ~3-4с "мёртвой" тишины на некоторых
     # USB-микрофонах (AGC/калибровка драйвера), см. AudioRecorder._ensure_stream.
@@ -1050,6 +1072,8 @@ def main_loop(cfg: dict, cfg_path: Path):
         if cfg.get("play_sound"):
             threading.Thread(target=play_stop_beep, daemon=True).start()
         if not wav_path:
+            if recorder.last_skip_reason and recorder.last_skip_reason != "empty":
+                print(f"⏭  Skipped ({recorder.last_skip_reason}) — no speech detected")
             tray.set_state("idle")
             if cursor_ind:
                 cursor_ind.hide()
@@ -1168,12 +1192,12 @@ def main_loop(cfg: dict, cfg_path: Path):
 
         def on_press(key):
             currently_pressed.add(_canonical_key(key))
-            if keys_needed.issubset(currently_pressed):
+            if _hotkey_satisfied(keys_needed, currently_pressed):
                 cmd_queue.put("start")
 
         def on_release(key):
             ck = _canonical_key(key)
-            if ck in keys_needed and state.is_recording:
+            if any(_token_matches(t, ck) for t in keys_needed) and state.is_recording:
                 cmd_queue.put("stop")
             currently_pressed.discard(ck)
 
@@ -1206,17 +1230,39 @@ def _parse_hotkey(s: str) -> set:
     return keys
 
 
+_SIDED_MODIFIERS = ("ctrl", "shift", "alt", "cmd")
+
+
+def _token_matches(token: str, pressed_key: str) -> bool:
+    """Сравнивает один нужный токен хоткея (из _parse_hotkey) с одной
+    нажатой канонической клавишей (из _canonical_key, с сохранённой
+    стороной — "ctrl_l"/"ctrl_r", не просто "ctrl").
+
+    Токен без указания стороны ("ctrl") — матчится на любую сторону
+    ("ctrl_l" ИЛИ "ctrl_r"), как было раньше. Токен с явной стороной
+    ("ctrl_r") — матчится только на эту конкретную сторону. Это нужно,
+    чтобы хоткей можно было привязать к "только правый Ctrl", не
+    перехватывая обычный левый Ctrl (занят раскладкой/другими шорткатами).
+    """
+    if token in _SIDED_MODIFIERS:
+        return pressed_key == token or pressed_key.startswith(token + "_")
+    return pressed_key == token
+
+
+def _hotkey_satisfied(needed: set, pressed: set) -> bool:
+    return all(any(_token_matches(t, p) for p in pressed) for t in needed)
+
+
 def _canonical_key(key) -> str:
-    """Канонизирует key из pynput в строку, совпадающую с _parse_hotkey."""
+    """Канонизирует key из pynput в строку, совпадающую с _parse_hotkey.
+
+    Сторона (_l/_r) сохраняется как есть (не схлопывается в общий
+    "ctrl"/"shift") — сравнение "общий токен матчит любую сторону"
+    делает _token_matches, а не эта функция.
+    """
     from pynput.keyboard import Key, KeyCode
     if isinstance(key, Key):
-        # Key.ctrl_l, Key.shift_r → "ctrl", "shift"
-        name = key.name
-        # Убрать суффиксы _l/_r
-        for suffix in ("_l", "_r"):
-            if name.endswith(suffix):
-                name = name[:-2]
-        return name
+        return key.name
     if isinstance(key, KeyCode):
         if key.char:
             return key.char.lower()
