@@ -316,6 +316,7 @@ class AudioRecorder:
                 samplerate=self.sample_rate,
                 channels=self.channels,
                 dtype="float32",
+                latency="low",
                 callback=callback,
             )
             stream.start()
@@ -1080,6 +1081,18 @@ def main_loop(cfg: dict, cfg_path: Path):
             return
         duration_ms = recorder.duration_sec * 1000
 
+        # Debug: keep a copy of the last raw capture so a cutoff/garble report
+        # can be diagnosed after the fact (was the audio itself short, or did
+        # transcription drop content that was actually captured?). Cheap
+        # (single small WAV, overwritten each time) and always on — no config
+        # flag, since this is exactly the evidence needed when things go wrong.
+        try:
+            import shutil
+            shutil.copyfile(wav_path, str(Path(cfg["log_file"]).parent / "last_dictation_raw.wav")
+                             if cfg.get("log_file") else str(Path(tempfile.gettempdir()) / "last_dictation_raw.wav"))
+        except Exception as e:
+            logging.warning(f"debug wav copy failed: {e}")
+
         if duration_ms < cfg.get("min_duration_ms", 300):
             print(f"⏭  Skipped (too short: {duration_ms:.0f}ms)")
             try: os.unlink(wav_path)
@@ -1106,6 +1119,20 @@ def main_loop(cfg: dict, cfg_path: Path):
                     verbose=False,
                 )
                 text = result.text.strip()
+                # whisper-server (response_format=text) joins its internal decode
+                # segments with a literal "\n" — these land wherever the model's
+                # timing-based segmentation happened to fall, not at sentence or
+                # word boundaries (found 2026-07-10: a single continuous utterance
+                # came back as "...появилось он появился\n enter и то часть...",
+                # cutting a real sentence in half with a raw newline). Some paste
+                # targets (chat-style inputs that submit on Enter) treat an
+                # embedded newline in pasted text as if the user pressed Enter,
+                # sending the message early and silently dropping everything
+                # after the first "\n" — this looked like "half the dictation
+                # never arrived" but the transcription itself was complete all
+                # along. Collapse these into spaces; they're not intentional
+                # line breaks.
+                text = " ".join(line.strip() for line in text.splitlines() if line.strip())
                 elapsed = time.time() - t0
 
                 if not text:
@@ -1127,11 +1154,19 @@ def main_loop(cfg: dict, cfg_path: Path):
                     if cfg.get("auto_paste"):
                         time.sleep(0.25)  # дать целевому полю стать активным
                         paste_from_clipboard()
-                        # Восстанавливаем буфер асинхронно через 1с —
+                        # Восстанавливаем буфер асинхронно с задержкой —
                         # таргет должен успеть обработать WM_PASTE и
                         # прочитать диктованный текст до того, как мы
-                        # вернём оригинал.
-                        restore_clipboard_deferred(saved_clipboard, delay_sec=1.0)
+                        # вернём оригинал. Было 1.0с фиксированно; поднято
+                        # до >=1.5с и масштабируется с длиной текста —
+                        # 1с оказался мал для медленных таргетов (веб-чаты,
+                        # редакторы с большой площадью рендеринга): при
+                        # длинном тексте приложение может ещё дочитывать
+                        # буфер, когда мы его уже подменяем оригиналом —
+                        # видно как "половина фразы не вставилась" (найдено
+                        # 2026-07-10, Дмитрий сообщил про Bad/половину фразы).
+                        restore_delay = max(1.5, min(4.0, len(text_to_paste) / 40))
+                        restore_clipboard_deferred(saved_clipboard, delay_sec=restore_delay)
                     state.last_dictation_at = now
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
