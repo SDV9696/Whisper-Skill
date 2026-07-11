@@ -286,6 +286,18 @@ class AudioRecorder:
         self.last_skip_reason: Optional[str] = None
         self._lock = threading.Lock()
         self._init_lock = threading.Lock()
+        # Метка времени последнего вызова аудио-коллбэка (обновляется ВСЕГДА,
+        # даже когда не armed) — единственный способ отличить "поток жив, но
+        # тихо" от "поток умер после сбоя драйвера" (см. _record_start_ts ниже).
+        # Найдено 2026-07-11: после "input overflow" на этом USB-мике коллбэк
+        # PortAudio иногда перестаёт вызываться вовсе, но stream.start() уже
+        # был вызван раньше и внешне всё выглядит "работающим" — start()/stop()
+        # не бросают исключений, просто frames всегда пустые и
+        # last_skip_reason="empty", которое сознательно не печатается (см.
+        # stop_and_transcribe) — то есть зависание выглядело как полная тишина
+        # без единой строки в логе после "Recording...".
+        self._last_callback_ts: float = 0.0
+        self._record_start_ts: float = 0.0
 
     def _ensure_stream(self) -> None:
         """Открыть входной поток один раз и больше не закрывать.
@@ -306,6 +318,7 @@ class AudioRecorder:
                 return
 
             def callback(indata, frames, time_info, status):
+                self._last_callback_ts = time.time()
                 if status:
                     logging.warning(f"audio status: {status}")
                 with self._lock:
@@ -322,12 +335,31 @@ class AudioRecorder:
             stream.start()
             self._stream = stream
 
+    def _recreate_stream(self) -> None:
+        """Закрыть текущий (предположительно мёртвый) поток и обнулить
+        self._stream, чтобы следующий _ensure_stream() открыл новый.
+
+        Закрытие мёртвого потока само может зависнуть на некоторых
+        драйверах, но это не хуже текущего состояния (поток и так не
+        отдаёт данные) — а самовосстановление лучше, чем тишина до
+        ручного перезапуска всего процесса диктовки.
+        """
+        with self._init_lock:
+            old = self._stream
+            self._stream = None
+            if old is not None:
+                try:
+                    old.close()
+                except Exception as e:
+                    logging.warning(f"error closing dead stream: {e}")
+
     def start(self) -> None:
         self._ensure_stream()
         with self._lock:
             self._frames = []
             self._armed = True
         self._recording = True
+        self._record_start_ts = time.time()
 
     def stop(self) -> Optional[str]:
         """Остановить запись и сохранить в WAV. Вернуть путь к файлу."""
@@ -347,6 +379,30 @@ class AudioRecorder:
         self.last_skip_reason = None
         if not frames:
             self.last_skip_reason = "empty"
+            held_sec = time.time() - self._record_start_ts
+            callback_stall_sec = time.time() - self._last_callback_ts if self._last_callback_ts else None
+            # Держали хоткей достаточно долго, чтобы ожидать хоть что-то, но
+            # frames пустые. Раньше это молча проглатывалось (last_skip_reason
+            # == "empty" сознательно не печатается в stop_and_transcribe, чтобы
+            # не спамить при случайных мгновенных нажатиях) — и выглядело как
+            # "диктовка вообще ничего не делает" без единой строки в логе.
+            if held_sec > 0.5:
+                if callback_stall_sec is not None and callback_stall_sec > 1.0:
+                    # Аудио-коллбэк PortAudio не вызывался всё время записи —
+                    # поток реально мёртв (не просто "тихо"), обычно после
+                    # "input overflow" на этом USB-мике. Пересоздаём поток,
+                    # чтобы следующая запись не повторила ту же тишину.
+                    logging.error(
+                        f"audio callback dead: held={held_sec:.1f}s, "
+                        f"no callback for {callback_stall_sec:.1f}s — "
+                        f"reopening input stream"
+                    )
+                    self._recreate_stream()
+                else:
+                    logging.warning(
+                        f"empty recording: held={held_sec:.1f}s but 0 frames "
+                        f"captured (callback alive, stall={callback_stall_sec})"
+                    )
             return None
         audio = np.concatenate(frames, axis=0)
         audio = _trim_edge_silence(audio, self.sample_rate, self.trim_silence_ms)
